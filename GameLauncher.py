@@ -625,8 +625,6 @@ class GameLauncher(QMainWindow):
         print(self.selected_game_name)
 
         search_for_votv_exe()  
-
-
    
     def is_game_running(self):
         for proc in psutil.process_iter(attrs=['pid', 'name']):
@@ -634,8 +632,30 @@ class GameLauncher(QMainWindow):
                 return True
         return False
     
+    def move_in_progress(self, source_backup_folder, destination_folder):
+        # Get a list of files in the source backup folder
+        files_to_move = os.listdir(source_backup_folder)
+
+        for item in files_to_move:
+            source_item = os.path.join(source_backup_folder, item)
+            destination_item = os.path.join(destination_folder, item)
+
+            try:
+                # Attempt to move the file
+                shutil.move(source_item, destination_item)
+            except shutil.Error:
+                # An exception occurred during the move, indicating the operation is in progress
+                return True
+
+        # If no exceptions occurred, the move operation is completed
+        return False
+        
     def launch_game(self):
         try:
+            source_backup_folder = os.path.join(os.path.dirname(__file__), "game backups", self.selected_game_name, "Saved")
+            destination_folder = os.path.join(os.path.expanduser("~"), "AppData", "Local", "VotV", "Saved")
+
+            self.move_game_data(source_backup_folder)
             startupinfo = subprocess.STARTUPINFO()
             startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
             process = subprocess.Popen(self.game_path, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
@@ -644,6 +664,8 @@ class GameLauncher(QMainWindow):
 
             print("Game has started. Now waiting for it to close...")
             self.hide()
+            while self.move_in_progress(source_backup_folder, destination_folder):
+                time.sleep(1)
 
             while True:
                 stdout = process.stdout.readline()
@@ -661,6 +683,31 @@ class GameLauncher(QMainWindow):
         except Exception as e:
             print(f"Error launching the game: {str(e)}")
 
+    def move_game_data(self, source_backup_folder):
+        backup_folder_path = os.path.join(source_backup_folder, self.selected_game_name)
+
+        if not os.path.exists(backup_folder_path):
+            print(f"No backup data found for '{self.selected_game_name}'.")
+            return
+
+        appdata_folder = os.path.expanduser("~")
+        local_folder = os.path.join(appdata_folder, "Local")
+        votv_folder = os.path.join(local_folder, "VotV")
+
+        if not os.path.exists(votv_folder):
+            os.makedirs(votv_folder)
+
+        for item in os.listdir(backup_folder_path):
+            source_item = os.path.join(backup_folder_path, item)
+            destination_item = os.path.join(votv_folder, item)
+
+            if os.path.getsize(source_item) == 0:
+                print(f"Skipping empty file: {source_item}")
+                continue
+
+            shutil.move(source_item, destination_item)
+
+        print(f"Game data for '{self.selected_game_name}' moved to '{votv_folder}'.")
 
     def perform_backup(self):
         source_folder = os.path.join(os.path.expanduser("~"), "AppData", "Local", "VotV", "Saved")
@@ -699,27 +746,6 @@ class GameLauncher(QMainWindow):
 
         except Exception as e:
             print(f"Error during backup: {str(e)}")
-
-            
-    def launch_game_and_backup(self):
-        if os.path.exists(self.game_path):
-            print("Launching the game...")
-
-            try:
-                process = subprocess.Popen(self.game_path, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                game_pid = process.pid
-                print(f"Game PID: {game_pid}")
-
-                print("Game has started. Now waiting for it to close...")
-                while psutil.pid_exists(game_pid):
-                    time.sleep(1)
-
-                print("Game has closed. Starting backup...")
-                self.perform_backup()
-            except Exception as e:
-                print(f"Error launching the game: {str(e)}")
-        else:
-            print(f"'votv.exe' not found in folder: {self.game_path}")
 
     def save_data(self):
         if not isinstance(self.version_name_map, dict):
