@@ -9,64 +9,91 @@ from PyQt5.QtGui import QIcon, QColor, QPixmap, QPainter
 from PyQt5.QtCore import Qt, pyqtSlot
 from PyQt5.QtWidgets import QMessageBox, QProgressDialog, QPushButton, QMainWindow, QListWidget, QDialog
 from bs4 import BeautifulSoup
-import py7zr
 from pySmartDL import SmartDL
 from functools import partial
 import pickle
-from patoolib import extract_archive
+from pyunpack import Archive
 import shutil
 import time
 import psutil
 import configparser
+from tqdm import tqdm
 import ctypes
 
-icon_path = "resources/icons.ico"
+# Path to 7-Zip executable (7z.exe)
+seven_zip_path = 'C:\\Program Files\\7-Zip\\7z.exe'
+
+# Path to the 7z archive and the output folder
+archive_path = ''
+output_folder = 'output_folder'
+
+# Use 7-Zip to extract the archive
+subprocess.call([seven_zip_path, 'x', archive_path, f'-o{output_folder}'])
+
+icon_path = "resources/icons/icon.ico"
 ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("VoidLauncher")
 ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(icon_path)
 
 class Config:
     config_file = "config.ini"
-    exe_dir = os.path.dirname(sys.executable)
-
-    archived_installs_folder = os.path.join(exe_dir, "archives")
 
     @classmethod
-    def get_archived_installs_folder(cls):
-        return os.path.abspath(os.path.join(os.path.dirname(__file__), cls.archived_installs_folder))
+    def get_config_path(cls):
+        exe_dir = os.path.dirname(sys.executable)
+        return os.path.join(exe_dir, cls.config_file)
+
+    @classmethod
+    def ensure_config_file_exists(cls):
+        exe_dir = os.path.dirname(sys.executable)
+        config_path = cls.get_config_path()
+        if not os.path.exists(config_path):
+            # Create the config file with default values
+            config = configparser.ConfigParser()
+            config["Paths"] = {"game_destination_folder": os.path.join(exe_dir, "game")}
+            config["Settings"] = {"dont_show_initial_dialog": "False"}
+            
+            with open(config_path, "w") as configfile:
+                config.write(configfile)
 
     @classmethod
     def get_game_destination_folder(cls):
+        cls.ensure_config_file_exists()
         config = configparser.ConfigParser()
-        config.read(cls.config_file)
-        exe_dir = os.path.dirname(sys.executable)
-
-        game_folder = os.path.join(exe_dir, "game")
-
-        return config.get("Paths", "game_destination_folder", fallback=game_folder)
+        config.read(cls.get_config_path())
+        return config.get("Paths", "game_destination_folder")
+    
     @classmethod
     def set_game_destination_folder(cls, new_folder):
+        cls.ensure_config_file_exists() 
         config = configparser.ConfigParser()
-        config.read(cls.config_file)
+        config.read(cls.get_config_path())
         config.set("Paths", "game_destination_folder", new_folder)
 
-        with open(cls.config_file, "w") as configfile:
+        with open(cls.get_config_path(), "w") as configfile:
             config.write(configfile)
-            
+
     @classmethod
     def get_dont_show_initial_dialog(cls):
+        cls.ensure_config_file_exists() 
         config = configparser.ConfigParser()
-        config.read(cls.config_file)
-        return config.getboolean("Settings", "dont_show_initial_dialog", fallback=False)
+        config.read(cls.get_config_path())
+        return config.getboolean("Settings", "dont_show_initial_dialog")
 
     @classmethod
     def set_dont_show_initial_dialog(cls, value):
+        cls.ensure_config_file_exists()
         config = configparser.ConfigParser()
-        config.read(cls.config_file)
+        config.read(cls.get_config_path())
         config.set("Settings", "dont_show_initial_dialog", str(value))
 
-        with open(cls.config_file, "w") as configfile:
+        with open(cls.get_config_path(), "w") as configfile:
             config.write(configfile)
-    
+
+    @classmethod
+    def get_archived_installs_folder(cls):
+        exe_dir = os.path.dirname(sys.executable)
+        return os.path.join(exe_dir, "archives")
+
 class DownloadWorker(QtCore.QObject):
     update_download_progress = QtCore.pyqtSignal(int)
     download_error = QtCore.pyqtSignal(str)
@@ -109,22 +136,27 @@ class DownloadWorker(QtCore.QObject):
         extraction_thread = threading.Thread(target=self.start_extraction_and_move)
         extraction_thread.start()
 
-    def start_extraction_and_move(self):   
+    def start_extraction_and_move(self):
         try:
             if not os.path.exists(self.archived_installs_path) or not os.path.exists(self.game_destination_path):
-                print("Source or destination folder does not exist.")
-                return
+                os.makedirs(self.game_destination_path)  # Create the destination path if it doesn't exist
+
+            seven_zip_path = 'C:\\Program Files\\7-Zip\\7z.exe'
 
             for root, _, files in os.walk(self.archived_installs_path):
                 for file in files:
-                    if file.endswith(".7z"):                        
+                    if file.endswith(".7z"):
                         print("found 7z file")
                         source_file = os.path.join(root, file)
-                        subfolder = os.path.splitext(file)[0]
-                        self.output_folder = os.path.join(self.game_destination_path, subfolder)
+                        self.output_folder = self.game_destination_path  # Use game_destination_path as the output folder
                         print(self.output_folder)
-                                    
-                        extract_archive(source_file, outdir=self.output_folder)
+
+                        if os.path.exists(seven_zip_path):
+                            subprocess.call([seven_zip_path, 'x', source_file, '-o' + self.output_folder, '-y'])
+                        else:
+                            print("7-Zip not found. Please install 7-Zip to extract 7z archives.")
+                            return
+
                         os.remove(source_file)
                         print(f"Extracted and deleted: {source_file}")
                         self.extraction_completed.emit()
@@ -142,7 +174,6 @@ class CustomListWidget(QListWidget):
                 print(f"Selected item: {selected_item.text()}")
 
         super().keyPressEvent(event)
-
 
 class InitialDialog(QDialog):
     def __init__(self, config, dialog_text):
@@ -184,6 +215,7 @@ class GameLauncher(QMainWindow):
         self.resize(1280, 720)
         self.selected_game_names = ["VotV-Win64-Shipping.exe"]
         self.selected_game_name = ""
+        self.script_directory = os.path.dirname(sys.argv[0])
         self.download_worker = download_worker
         self.archived_installs_path = Config.get_archived_installs_folder()
         self.game_destination_path = Config.get_game_destination_folder()
@@ -229,7 +261,7 @@ class GameLauncher(QMainWindow):
         self.setupTabWidget()
         self.setupLibraryTab()
         self.setupDownloadsTab()
-        self.setupSettingsTab()
+        self.setupInfoTab()
         self.setupHtmlContent()
         self.setupStyles()
         self.connectActions()
@@ -369,7 +401,7 @@ class GameLauncher(QMainWindow):
         self.layout.addWidget(self.tab_widget, 1, 0, 1, 2)
         self.tab_widget.setContentsMargins(0, 0, 0, 0)
         self.tab_widget.setStyleSheet("QTabWidget::pane { border: 0; }")
-        self.tab_names = ["Library", "Downloads", "Settings"]
+        self.tab_names = ["Library", "Downloads", "Info"]
         self.tabs = []
 
         for name in self.tab_names:
@@ -385,10 +417,20 @@ class GameLauncher(QMainWindow):
         
         button_layout = QtWidgets.QHBoxLayout()
         
-        self.game_path_button = QPushButton("Add game to library")
+        self.game_path_button = QPushButton("Manually add game to library")
         self.game_path_button.setMaximumWidth(400)
         self.game_path_button.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
         button_layout.addWidget(self.game_path_button, alignment=Qt.AlignCenter)                   
+        
+        self.game_backup_path_button = QPushButton("Open save backups")
+        self.game_backup_path_button.setMaximumWidth(400)
+        self.game_backup_path_button.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        button_layout.addWidget(self.game_backup_path_button, alignment=Qt.AlignCenter)                   
+        
+        self.refesh_library = QPushButton("Refresh Library")
+        self.refesh_library.setMaximumWidth(400)
+        self.refesh_library.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        button_layout.addWidget(self.refesh_library, alignment=Qt.AlignCenter)                   
 
         button_layout.addStretch()
                 
@@ -423,67 +465,84 @@ class GameLauncher(QMainWindow):
         self.tab1_layout.addWidget(self.reload_data)
         self.tab1_layout.addWidget(self.download_button)
 
-    def setupSettingsTab(self):
+    def setupInfoTab(self):
         self.tab2_layout = QtWidgets.QVBoxLayout(self.tabs[2])
-
-        self.toggle_layout = QtWidgets.QHBoxLayout()
-        self.toggle_label = QtWidgets.QLabel("Install games to a custom path?")
-        self.toggle_label.setStyleSheet("color: white;")
-        self.toggle_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
-        self.toggle_button = QtWidgets.QCheckBox()
-        self.toggle_button.setChecked(False)
-        self.toggle_button.stateChanged.connect(self.toggle_input)
-        self.toggle_layout.addWidget(self.toggle_label)
-        self.toggle_layout.addWidget(self.toggle_button)
-
-        self.file_path_and_button_layout = QtWidgets.QHBoxLayout()
-        self.file_path_label = QtWidgets.QLabel("Game Install Path:")
-        self.file_path_label.setStyleSheet("color: gray")
-        self.file_path_input = QtWidgets.QLineEdit()
-        self.file_path_input.setStyleSheet("color: gray")
-        self.file_path_input.setDisabled(True)
-        self.file_path_input.setText(self.game_destination_path)
-        self.action_button = QtWidgets.QPushButton("Choose Folder")
-        self.action_button.clicked.connect(self.perform_action_with_folder_path)
-        self.action_button.setDisabled(True)
-        self.action_button.setStyleSheet("color: gray")
-        self.file_path_and_button_layout.addWidget(self.file_path_label)
-        self.file_path_and_button_layout.addWidget(self.file_path_input)
-        self.file_path_and_button_layout.addWidget(self.action_button)
-
-        self.reset_button = QPushButton("Reset to defaults")
-        self.reset_button.clicked.connect(self.reset_game_destination_folder)
-
-        reset_button_layout = QtWidgets.QHBoxLayout()
-        reset_button_layout.addStretch()
-        reset_button_layout.addWidget(self.reset_button)
-
-        self.tab2_layout.addLayout(self.toggle_layout)
-        self.tab2_layout.addLayout(self.file_path_and_button_layout)
-        self.tab2_layout.addLayout(reset_button_layout)
-
-
+        
+        # Create a QTextBrowser to display information with links
+        info_text = QtWidgets.QTextBrowser()
+        info_text.setOpenExternalLinks(True)
+        info_text.setOpenLinks(True)
+        
+        # Example text with links
+        info_text.setHtml('''
+            <div style="margin: 24px;">
+                <p style="font-size: 24px; color: white; text-align: center;">
+                    <b>Thank you for installing Void Launcher!</b>
+                </p>
+                          <br>
+                <p style="font-size: 20px; color: white; text-align: center;">
+                    Coding this program was my first experience with Python! There may be some issues so please be patient as I work to iron out the bugs!
+                </p>
+                          <br>
+                <p style="font-size: 20px; color: white; text-align: center;">
+                    As stated in the startup text, please make sure to back up your data before launching older versions of the game. It won't remove your saves as long as you don't load a newer save in an old version, but it will reset all your stats, achievements, and such. Starting up any version of Voices of the Void through this launcher will automatically save your data to the respective version's name.
+                </p>
+                          <br>
+                <p style="font-size: 20px; color: white; text-align: center;">
+                    You can access the save backup folder in the 'Library' tab.
+                </p>
+                </p>
+                          <br>
+                <p style="font-size: 20px; color: white; text-align: center;">
+                    Void Launcher also (partially) works with Steam Overlay! Add 'VoidLauncher.exe' as a non steam then Launch any installed game through the launcher! Note that this will only work the first time you launch a game, you'll have to restart Void Launcher for it to work again. 
+                </p>
+                          <br>
+                <p style="font-size: 20px; color: white; text-align: center;">
+                    Void Launcher would not have been possible without @entechcore/user#5555's website for hosting the files and their cooperation in making the site more friendly to parse the data from. If you have any queries, suggestions, or issues with the launcher, please contact me on Discord at @Tameranian, or email me at Tameraniantv@gmail.com.
+                </p>
+                          <br>
+                <p style="font-size: 20px; color: white; text-align: center;">
+                    This launcher has no affiliation with EternityDev/MrDrNose, the creator of Voices of the Void, It was made because I thought it'd be neat :D.
+                </p>
+                <br>
+                <p style="font-size: 20px; color: white; text-align: center;">
+                    Go support the creator of Voices of the Void on Patreon <a href="https://www.patreon.com/eternitydev" style="color: #007BFF; text-decoration: none;">here</a>.
+                </p>
+                <br>
+                <p style="font-size: 20px; color: white; text-align: center;">
+                    Join the Voices of the Void Discord <a href="https://discord.com/invite/WKBvqu4tjV" style="color: #007BFF; text-decoration: none;">here</a>.
+                </p>
+            </div>
+        ''')
+        # Add the QTextBrowser to the layout
+        self.tab2_layout.addWidget(info_text)
     def connectActions(self):
-        self.toggle_button.stateChanged.connect(self.toggle_input)
-        self.action_button.clicked.connect(self.perform_action_with_folder_path)
         self.versions_list.itemSelectionChanged.connect(self.load_selected_description)
         self.game_name_list.itemSelectionChanged.connect(self.load_selected_game_exe)
         self.download_button.clicked.connect(self.showDownloadDialog)
         self.reload_data.clicked.connect(self.refetch)
         self.launch_button.clicked.connect(self.launch_game)
         self.game_path_button.clicked.connect(self.open_game_folder)
+        self.refesh_library.clicked.connect(lambda: self.fetch_game_exe(self.game_destination_path))
+        self.game_backup_path_button.clicked.connect(self.open_game_backup_folder)
         
-    def reset_game_destination_folder(self):
-            program_location = os.path.dirname(os.path.abspath(__file__))  
-            new_folder = os.path.join(program_location, "game")
-            self.file_path_input.setText(new_folder)
-            Config.set_game_destination_folder(new_folder)
-
-
     def open_game_folder(self):
-            if self.game_destination_path:
-                subprocess.Popen(['explorer', self.game_destination_path], shell=True)
-                
+        if self.game_destination_path:
+            subprocess.Popen(['explorer', self.game_destination_path], shell=True)
+
+    def open_game_backup_folder(self):
+        if self.game_destination_path:    
+            print(self.game_destination_path)        
+            game_backups_path = os.path.join(self.script_directory, "game backups")
+            print(game_backups_path)
+            source_save_folder = os.path.join(os.path.expanduser("~"), "AppData", "Local", "VotV", "Saved")
+            
+            if not os.path.exists(game_backups_path) or not os.path.isdir(game_backups_path):
+                os.makedirs(game_backups_path)
+
+            subprocess.Popen(['explorer', game_backups_path], shell=True)
+            subprocess.Popen(['explorer', source_save_folder], shell=True)
+
     def toggle_input(self, state):
         if state == Qt.Checked:
             self.file_path_input.setDisabled(False)
@@ -539,7 +598,7 @@ class GameLauncher(QMainWindow):
         QtWidgets.qApp.processEvents()
 
         self.download_worker.start_download(url)
-
+    
     pyqtSlot(int)
     def update_download_progress(self, progress):
         self.progress_dialog.setValue(progress)        
@@ -567,7 +626,17 @@ class GameLauncher(QMainWindow):
 
     pyqtSlot()
     def extract_file(self):                                                               
-        QtWidgets.qApp.processEvents()       
+        QtWidgets.qApp.processEvents()        
+        selected_item = self.versions_list.currentItem()
+        selected_version = selected_item.text()
+        self.extract_dialog = QProgressDialog(f'"Extracting" {selected_version}', "Cancel", 0, 0, self)
+        self.extract_dialog.setWindowModality(Qt.WindowModal)
+        cancel_buttons = self.extract_dialog.findChildren(QPushButton)
+        if cancel_buttons:
+            cancel_buttons[0].hide()
+        self.extract_dialog.setWindowTitle("Extracting")
+        self.extract_dialog.show()
+
         self.download_worker.extract_and_move_thread()
 
     pyqtSlot()
@@ -575,33 +644,41 @@ class GameLauncher(QMainWindow):
         selected_item = self.versions_list.currentItem()
         selected_version = selected_item.text()
         self.fetch_game_exe(self.game_destination_path)
+        self.extract_dialog.close()
         QMessageBox.information(self, "Download Completed", f'"{selected_version}" has installed successfully.\n\nCheck your library!', QMessageBox.Ok)
         print("Download Completed")
 
 
+
     def fetch_game_exe(self, folder_path):
-        if not os.path.exists(folder_path):
-            print(f"Directory '{folder_path}' does not exist.")
-            return
-        game_exe = []
+        try:
+            self.game_name_list.clear()
+            if not os.path.exists(folder_path):
+                print(f"Directory '{folder_path}' does not exist.")
+                return
+            game_exe = []
 
-        def search_for_votv_exe(path):
-            for root, _, files in os.walk(path):
-                for file in files:
-                    if file == 'VotV.exe':
-                        self.game_exe = file
-                        self.game_path = os.path.join(root, file)
-                        parent_folder = os.path.basename(os.path.dirname(root))
-                        game_exe.append(parent_folder)
+            self.search_for_votv_exe(folder_path, game_exe)
 
-        search_for_votv_exe(folder_path)
+            if not game_exe:
+                print("No 'VotV.exe' found.")
+                return
 
-        if not game_exe:
-            print("No folders with 'votv.exe' found.")
+            for game_path in game_exe:
+                self.game_name_list.addItem(game_path)  # Add each path to the list
+        except Exception as e:
+            print(f"An error occurred in fetch_game_exe: {str(e)}")
+
     
-        for item in game_exe:
-            self.game_name_list.addItem(item)
-                  
+    def search_for_votv_exe(self, path, game_exe):
+        for root, _, files in os.walk(path):
+            for file in files:
+                if file == 'VotV.exe':
+                    game_path = os.path.join(root, file)
+                    parent_folder = os.path.basename(os.path.dirname(root))
+                    game_exe.append(parent_folder)  # Append the full path to 'VotV.exe' to the list
+
+                    
     def load_selected_description(self):
         selected_item = self.versions_list.currentItem()
         if selected_item:
@@ -628,34 +705,43 @@ class GameLauncher(QMainWindow):
    
     def is_game_running(self):
         for proc in psutil.process_iter(attrs=['pid', 'name']):
-            if any(name.lower() in proc.info['name'].lower() for name in self.selected_game_names):
-                return True
+            try:
+                process_name = proc.info['name'].lower()
+                for name in self.selected_game_names:
+                    if name.lower() in process_name:
+                        return True
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                pass
         return False
-    
+        
     def move_in_progress(self, source_backup_folder, destination_folder):
-        # Get a list of files in the source backup folder
         files_to_move = os.listdir(source_backup_folder)
+        errors_encountered = False
 
         for item in files_to_move:
             source_item = os.path.join(source_backup_folder, item)
             destination_item = os.path.join(destination_folder, item)
 
             try:
-                # Attempt to move the file
                 shutil.move(source_item, destination_item)
-            except shutil.Error:
-                # An exception occurred during the move, indicating the operation is in progress
-                return True
+            except shutil.Error as e:
+                print(f"Error moving file: {e}")
+                errors_encountered = True
 
-        # If no exceptions occurred, the move operation is completed
-        return False
+        return errors_encountered
         
     def launch_game(self):
         try:
-            source_backup_folder = os.path.join(os.path.dirname(__file__), "game backups", self.selected_game_name, "Saved")
-            destination_folder = os.path.join(os.path.expanduser("~"), "AppData", "Local", "VotV", "Saved")
+            source_backup_folder = os.path.join(self.script_directory, "game backups", self.selected_game_name, "Saved")
+            source_save_folder = os.path.join(os.path.expanduser("~"), "AppData", "Local", "VotV", "Saved")
 
-            self.move_game_data(source_backup_folder)
+            if not os.path.exists(source_backup_folder):
+                os.makedirs(source_backup_folder, exist_ok=True)
+
+            if not os.path.exists(source_save_folder):
+                os.makedirs(source_save_folder)
+                
+            self.move_game_data(source_backup_folder, source_save_folder)
             startupinfo = subprocess.STARTUPINFO()
             startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
             process = subprocess.Popen(self.game_path, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
@@ -664,7 +750,7 @@ class GameLauncher(QMainWindow):
 
             print("Game has started. Now waiting for it to close...")
             self.hide()
-            while self.move_in_progress(source_backup_folder, destination_folder):
+            while self.move_in_progress(source_backup_folder, source_save_folder):
                 time.sleep(1)
 
             while True:
@@ -677,29 +763,23 @@ class GameLauncher(QMainWindow):
                 if stderr:
                     print(f"Game Error: {stderr.strip()}")
 
-            self.perform_backup()
+            self.perform_backup(source_backup_folder, source_save_folder)
+            print("backup done")
             self.show()
 
         except Exception as e:
             print(f"Error launching the game: {str(e)}")
 
-    def move_game_data(self, source_backup_folder):
+    def move_game_data(self, source_backup_folder, source_save_folder):
         backup_folder_path = os.path.join(source_backup_folder, self.selected_game_name)
 
         if not os.path.exists(backup_folder_path):
             print(f"No backup data found for '{self.selected_game_name}'.")
             return
 
-        appdata_folder = os.path.expanduser("~")
-        local_folder = os.path.join(appdata_folder, "Local")
-        votv_folder = os.path.join(local_folder, "VotV")
-
-        if not os.path.exists(votv_folder):
-            os.makedirs(votv_folder)
-
         for item in os.listdir(backup_folder_path):
             source_item = os.path.join(backup_folder_path, item)
-            destination_item = os.path.join(votv_folder, item)
+            destination_item = os.path.join(source_save_folder, item)
 
             if os.path.getsize(source_item) == 0:
                 print(f"Skipping empty file: {source_item}")
@@ -707,24 +787,21 @@ class GameLauncher(QMainWindow):
 
             shutil.move(source_item, destination_item)
 
-        print(f"Game data for '{self.selected_game_name}' moved to '{votv_folder}'.")
+        print(f"Game data for '{self.selected_game_name}' moved to '{source_save_folder}'.")
 
-    def perform_backup(self):
-        source_folder = os.path.join(os.path.expanduser("~"), "AppData", "Local", "VotV", "Saved")
-        destination_folder = os.path.join(os.path.dirname(__file__), "game backups", self.selected_game_name, "Saved")
-
+    def perform_backup(self, source_backup_folder, source_save_folder):
+        print("starting backup")
         try:
-            if os.path.exists(destination_folder):
-                shutil.rmtree(destination_folder)
-
-            os.makedirs(destination_folder, exist_ok=True)
+            print("trying backup")
+            if os.path.exists(source_backup_folder):
+                os.makedirs(source_backup_folder, exist_ok=True)
 
             while self.is_game_running():
                 time.sleep(1)
 
             print("Game has closed. Starting backup...")
 
-            for root, _, files in os.walk(source_folder):
+            for root, _, files in os.walk(source_save_folder):
                 for item in files:
                     source_item = os.path.join(root, item)
 
@@ -733,8 +810,8 @@ class GameLauncher(QMainWindow):
                             print(f"Skipping empty file: {source_item}")
                             continue
 
-                        relative_path = os.path.relpath(source_item, source_folder)
-                        destination_item = os.path.join(destination_folder, relative_path)
+                        relative_path = os.path.relpath(source_item, source_save_folder)
+                        destination_item = os.path.join(source_backup_folder, relative_path)
 
                         os.makedirs(os.path.dirname(destination_item), exist_ok=True)
 
@@ -746,6 +823,7 @@ class GameLauncher(QMainWindow):
 
         except Exception as e:
             print(f"Error during backup: {str(e)}")
+
 
     def save_data(self):
         if not isinstance(self.version_name_map, dict):
