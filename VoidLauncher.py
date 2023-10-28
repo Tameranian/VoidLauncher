@@ -6,13 +6,12 @@ import threading
 import subprocess
 from PyQt5 import QtCore, QtGui, QtWidgets
 from PyQt5.QtGui import QIcon, QColor, QPixmap, QPainter
-from PyQt5.QtCore import Qt, pyqtSlot
-from PyQt5.QtWidgets import QMessageBox, QProgressDialog, QPushButton, QMainWindow, QListWidget, QDialog
+from PyQt5.QtCore import Qt, pyqtSlot, QDateTime, QThread
+from PyQt5.QtWidgets import QMessageBox, QProgressDialog, QPushButton, QMainWindow, QListWidget, QDialog, QFileDialog
 from bs4 import BeautifulSoup
 from pySmartDL import SmartDL
 from functools import partial
 import pickle
-from pyunpack import Archive
 import shutil
 import time
 import psutil
@@ -50,11 +49,30 @@ class Config:
             # Create the config file with default values
             config = configparser.ConfigParser()
             config["Paths"] = {"game_destination_folder": os.path.join(exe_dir, "game")}
-            config["Settings"] = {"dont_show_initial_dialog": "False"}
+            config["Settings"] = {
+                "disable_initial_dialog": "False",
+                "last_refresh_time": "" 
+            }
             
             with open(config_path, "w") as configfile:
                 config.write(configfile)
+                
+    @classmethod
+    def get_last_refresh_time(cls):
+        cls.ensure_config_file_exists() 
+        config = configparser.ConfigParser()
+        config.read(cls.get_config_path())
+        return config.get("Settings", "last_refresh_time")
 
+    @classmethod
+    def set_last_refresh_time(cls, value):
+        cls.ensure_config_file_exists()
+        config = configparser.ConfigParser()
+        config.read(cls.get_config_path())
+        config.set("Settings", "last_refresh_time", value)
+
+        with open(cls.get_config_path(), "w") as configfile:
+            config.write(configfile)
     @classmethod
     def get_game_destination_folder(cls):
         cls.ensure_config_file_exists()
@@ -73,18 +91,18 @@ class Config:
             config.write(configfile)
 
     @classmethod
-    def get_dont_show_initial_dialog(cls):
+    def get_disable_initial_dialog(cls):
         cls.ensure_config_file_exists() 
         config = configparser.ConfigParser()
         config.read(cls.get_config_path())
-        return config.getboolean("Settings", "dont_show_initial_dialog")
+        return config.getboolean("Settings", "disable_initial_dialog")
 
     @classmethod
-    def set_dont_show_initial_dialog(cls, value):
+    def set_disable_initial_dialog(cls, value):
         cls.ensure_config_file_exists()
         config = configparser.ConfigParser()
         config.read(cls.get_config_path())
-        config.set("Settings", "dont_show_initial_dialog", str(value))
+        config.set("Settings", "disable_initial_dialog", str(value))
 
         with open(cls.get_config_path(), "w") as configfile:
             config.write(configfile)
@@ -99,6 +117,7 @@ class DownloadWorker(QtCore.QObject):
     download_error = QtCore.pyqtSignal(str)
     download_completed = QtCore.pyqtSignal()
     extract_file = QtCore.pyqtSignal()
+    update_extract_progress = QtCore.pyqtSignal(int)
     extraction_completed = QtCore.pyqtSignal()
 
     def __init__(self):        
@@ -107,9 +126,6 @@ class DownloadWorker(QtCore.QObject):
         self.output_folder = ""
         self.cancelled = False
         super().__init__()
-
-    def get_output_folder(self):
-        return self.output_folder   
 
     def start_download(self, url):
         self.cancelled = False
@@ -188,15 +204,11 @@ class InitialDialog(QDialog):
 
         label = QtWidgets.QLabel(dialog_text)
 
-        dont_show_button = QPushButton("Don't show again")
         self.ok_button = QPushButton("I understand")
 
         button_layout = QtWidgets.QVBoxLayout()
         button_layout.addWidget(label)
         button_layout.addWidget(self.ok_button)
-        button_layout.addWidget(dont_show_button)
-
-        dont_show_button.clicked.connect(self.set_dont_show)
         self.ok_button.clicked.connect(self.accept)
 
         self.setLayout(button_layout)
@@ -204,41 +216,41 @@ class InitialDialog(QDialog):
         # Store the configuration
         self.config = config
 
-    def set_dont_show(self):
-        self.config.set_dont_show_initial_dialog(True)
-        self.accept
-        self.close() 
+class VoidLauncher(QMainWindow):
 
-class GameLauncher(QMainWindow):
-    def __init__(self, download_worker):
+    def __init__(self, download_worker, game_fetch_worker):
         super().__init__()  
         self.resize(1280, 720)
+        app_icon = QIcon("resources/icons/icon.ico")  # Replace "path_to_your_icon.ico" with the actual path to your icon file        
+        self.setWindowTitle("Void Launcher")
+        app.setWindowIcon(app_icon)
         self.selected_game_names = ["VotV-Win64-Shipping.exe"]
         self.selected_game_name = ""
         self.script_directory = os.path.dirname(sys.argv[0])
         self.download_worker = download_worker
+        self.game_fetch_worker = game_fetch_worker
         self.archived_installs_path = Config.get_archived_installs_folder()
         self.game_destination_path = Config.get_game_destination_folder()
-        self.version_name_map = {}
-        self.version_description_map = {}
-        self.version_download_link_map = {}
+        self.version_name_map = self.game_fetch_worker.get_version_name_map
+        self.version_description_map = self.game_fetch_worker.get_version_description_map
+        self.version_download_link_map = self.game_fetch_worker.version_download_link_map        
+        self.final_descriptions_map = self.game_fetch_worker.get_final_descriptions_map
+        self.version_names = self.game_fetch_worker.get_version_names
         self.current_exe_path = ""
         self.current_description = ""
         self.current_download_link = ""
-        self.version_names = []
+        self.selected_version = ""
         self.game_exe = ""
-        self.game_path = ""        
-        self.final_descriptions_map = {}        
+        self.game_path = ""             
         self.game_process = None
-        config = Config()
+        self.config = Config()
         dialog_text = "Playing many older builds of Voices of the Void WILL reset your stats and\nachievements!\n\nIf you already have a version of Voices of the Void installed then make sure\nto add it to the library and launch through this program at least once!\n\nThis will back up your data and stop it from getting permanently deleted."
-        
-        if not config.get_dont_show_initial_dialog():
-            initial_dialog = InitialDialog(config, dialog_text)
+        if not self.config.get_disable_initial_dialog():
+            initial_dialog = InitialDialog(self.config, dialog_text)
             result = initial_dialog.exec_()
         self.init_ui()
         self.init_download_worker()
-        self.fetch_game_versions()
+        self.init_game_fetch_worker()
         self.show()
 
     def init_download_worker(self):
@@ -251,9 +263,15 @@ class GameLauncher(QMainWindow):
         self.download_worker.extraction_completed.connect(self.extraction_finished)
         self.download_thread.start()
 
+    def init_game_fetch_worker(self):
+        self.fetch_thread = QtCore.QThread()
+        self.game_fetch_worker.moveToThread(self.fetch_thread)
+        self.game_fetch_worker.game_fetch_worker_fetch_game_exe.connect(self.game_fetch_worker_fetch_game_exe)
+        download_function = partial(self.game_fetch_worker.fetch_game_versions)
+        threading.Thread(target=download_function).start()
+        self.fetch_thread.start()
+
     def init_ui(self):
-        self.setWindowTitle("Void Launcher")
-        self.setWindowIcon(QIcon("resources/icon.ico"))
         self.setWindowFlags(Qt.FramelessWindowHint)
         self.dragPosition = None
         self.setupLayout()
@@ -261,21 +279,17 @@ class GameLauncher(QMainWindow):
         self.setupTabWidget()
         self.setupLibraryTab()
         self.setupDownloadsTab()
+        self.setupSettingsTab()
         self.setupInfoTab()
         self.setupHtmlContent()
         self.setupStyles()
         self.connectActions()
-        additional_text = QtWidgets.QLabel("Created by @Tameranian3d/Tameranian, in collaboration with @entechcore/user#5555 (Version 0.1)")
+        additional_text = QtWidgets.QLabel("Created by @Tameranian3d/Tameranian, in collaboration with @entechcore/user#5555 (Version 0.2)")
         additional_text.setStyleSheet("color: white;")
         additional_text.setAlignment(Qt.AlignCenter)
 
         self.layout.addWidget(additional_text, 2, 0, 1, 2)
-    def show_initial_dialog(self):
-            initial_dialog = InitialDialog(self.config)
-            result = initial_dialog.exec_()
 
-            if result == QDialog.Accepted:
-                self.config.set_dont_show_initial_dialog(True)
     def setupStyles(self):
         dark_mode_stylesheet = """
             QMainWindow {
@@ -360,29 +374,6 @@ class GameLauncher(QMainWindow):
         self.reload_data.setStyleSheet(dark_mode_stylesheet)
 
     def setupHtmlContent(self):        
-        self.html_content_and_style = """
-        <!DOCTYPE html>
-        <html>
-        <head>
-        <style>
-            body {
-                background-color: #1C1C1C;
-                color: white;
-                font-size: 15px;
-            }
-            p {
-                font-size: 18px;
-            }
-            body h1 {
-                font-size: 20px;
-            }
-            body h1 {
-                font-size: 20px;
-            }
-        </style>
-        </head>
-        <body>
-        """
         self.html_content = ""
         self.description_text.setHtml(self.html_content)
     
@@ -401,7 +392,7 @@ class GameLauncher(QMainWindow):
         self.layout.addWidget(self.tab_widget, 1, 0, 1, 2)
         self.tab_widget.setContentsMargins(0, 0, 0, 0)
         self.tab_widget.setStyleSheet("QTabWidget::pane { border: 0; }")
-        self.tab_names = ["Library", "Downloads", "Info"]
+        self.tab_names = ["Library", "Downloads", "Info", "Settings"]
         self.tabs = []
 
         for name in self.tab_names:
@@ -417,12 +408,17 @@ class GameLauncher(QMainWindow):
         
         button_layout = QtWidgets.QHBoxLayout()
         
-        self.game_path_button = QPushButton("Manually add game to library")
+        self.add_game_install_button = QPushButton("Manually Add Installed Version")
+        self.add_game_install_button.setMaximumWidth(400)
+        self.add_game_install_button.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        button_layout.addWidget(self.add_game_install_button, alignment=Qt.AlignCenter)                   
+        
+        self.game_path_button = QPushButton("Open Library Folder")
         self.game_path_button.setMaximumWidth(400)
         self.game_path_button.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
         button_layout.addWidget(self.game_path_button, alignment=Qt.AlignCenter)                   
         
-        self.game_backup_path_button = QPushButton("Open save backups")
+        self.game_backup_path_button = QPushButton("Open Save Backups")
         self.game_backup_path_button.setMaximumWidth(400)
         self.game_backup_path_button.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
         button_layout.addWidget(self.game_backup_path_button, alignment=Qt.AlignCenter)                   
@@ -444,8 +440,9 @@ class GameLauncher(QMainWindow):
     def setupDownloadsTab(self):
         self.tab1_layout = QtWidgets.QVBoxLayout(self.tabs[1])
         self.download_button = QtWidgets.QPushButton("Download")
-        self.reload_data = QtWidgets.QPushButton("Check for new versions")
-        self.versions_list = CustomListWidget()
+        
+        self.reload_data = self.game_fetch_worker.get_reload_data()
+        self.versions_list = self.game_fetch_worker.get_versions_list()
         self.versions_list.setStyleSheet("""
             font-size: 18px;
             QListWidget::item:selected {
@@ -455,7 +452,7 @@ class GameLauncher(QMainWindow):
             }
         """)
         self.versions_list.setFocusPolicy(Qt.NoFocus)
-        self.description_text = QtWidgets.QTextBrowser()
+        self.description_text = self.game_fetch_worker.get_description_text()
         self.description_text.setOpenExternalLinks(True)
         self.description_text.setOpenLinks(True)
         self.splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
@@ -465,8 +462,30 @@ class GameLauncher(QMainWindow):
         self.tab1_layout.addWidget(self.reload_data)
         self.tab1_layout.addWidget(self.download_button)
 
+    def setupSettingsTab(self):
+        self.tab2_layout = QtWidgets.QVBoxLayout(self.tabs[3])  # Use QVBoxLayout for vertical layout
+
+        # Create a horizontal layout for the label and checkbox
+        toggle_layout = QtWidgets.QHBoxLayout()
+
+        self.toggle_label = QtWidgets.QLabel("Disable Startup Dialog")
+        self.toggle_label.setStyleSheet("color: white;margin-left: 500px;")  # Set text color to white   
+
+        self.toggle_startup_button = QtWidgets.QCheckBox()  # Use QCheckBox for the toggle
+        initial_state =  self.config.get_disable_initial_dialog()  # Invert the config value
+        self.toggle_startup_button.setChecked(initial_state)
+
+        toggle_layout.addWidget(self.toggle_label)  # Add the label to the horizontal layout
+        toggle_layout.addWidget(self.toggle_startup_button)  # Add the checkbox to the horizontal layout
+
+        # Add the horizontal layout to the vertical layout
+        self.tab2_layout.addLayout(toggle_layout)
+        
+        # Align the items within the horizontal layout to the top
+        toggle_layout.setAlignment(QtCore.Qt.AlignTop)
+
     def setupInfoTab(self):
-        self.tab2_layout = QtWidgets.QVBoxLayout(self.tabs[2])
+        self.tab3_layout = QtWidgets.QVBoxLayout(self.tabs[2])
         
         # Create a QTextBrowser to display information with links
         info_text = QtWidgets.QTextBrowser()
@@ -494,7 +513,7 @@ class GameLauncher(QMainWindow):
                 </p>
                           <br>
                 <p style="font-size: 20px; color: white; text-align: center;">
-                    Void Launcher also (partially) works with Steam Overlay! Add 'VoidLauncher.exe' as a non steam then Launch any installed game through the launcher! Note that this will only work the first time you launch a game, you'll have to restart Void Launcher for it to work again. 
+                    Void Launcher also works with Steam Overlay! Add 'VoidLauncher.exe' as a non steam then Launch any installed game through the launcher!
                 </p>
                           <br>
                 <p style="font-size: 20px; color: white; text-align: center;">
@@ -514,34 +533,83 @@ class GameLauncher(QMainWindow):
                 </p>
             </div>
         ''')
-        # Add the QTextBrowser to the layout
-        self.tab2_layout.addWidget(info_text)
+        self.tab3_layout.addWidget(info_text)
+   
     def connectActions(self):
+        initial_index = 2 if not self.config.get_disable_initial_dialog() else 0
+        self.tab_widget.setCurrentIndex(initial_index)
         self.versions_list.itemSelectionChanged.connect(self.load_selected_description)
         self.game_name_list.itemSelectionChanged.connect(self.load_selected_game_exe)
         self.download_button.clicked.connect(self.showDownloadDialog)
         self.reload_data.clicked.connect(self.refetch)
         self.launch_button.clicked.connect(self.launch_game)
-        self.game_path_button.clicked.connect(self.open_game_folder)
+        self.toggle_startup_button.clicked.connect(self.toggleStartupDialog)
+        self.game_path_button.clicked.connect(self.open_libray)
+        self.add_game_install_button.clicked.connect(self.add_game_install)
         self.refesh_library.clicked.connect(lambda: self.fetch_game_exe(self.game_destination_path))
         self.game_backup_path_button.clicked.connect(self.open_game_backup_folder)
-        
-    def open_game_folder(self):
+    
+    def toggleStartupDialog(self):
+        # Update the configuration based on the checkbox state
+        self.config.set_disable_initial_dialog(self.toggle_startup_button.isChecked())
+  
+    def open_libray(self):
         if self.game_destination_path:
             subprocess.Popen(['explorer', self.game_destination_path], shell=True)
 
+    def add_game_install(self):
+        if self.game_destination_path:
+            # Prompt the user to select a folder using a native file dialog
+            folder_dialog = QFileDialog.getExistingDirectory(
+                None,
+                "Select a folder",
+                options=QFileDialog.ShowDirsOnly
+            )
+
+            if folder_dialog:
+                # Check if "votv.exe" is in the selected folder
+                votv_exe_path = os.path.join(folder_dialog, "votv.exe")
+                parent_name = os.path.basename(folder_dialog)
+
+                if os.path.isfile(votv_exe_path):
+                    # Create a subfolder with the name of the parent folder
+                    destination_folder = os.path.join(self.game_destination_path, parent_name)
+                    try:
+                        shutil.copytree(folder_dialog, destination_folder, dirs_exist_ok=True)
+                        subprocess.Popen(['explorer', destination_folder], shell=True)
+                    except Exception as e:
+                        QMessageBox.critical(None, "Error", f"An error occurred: {str(e)}")
+                else:
+                    # Check if "votv.exe" is in the "WindowsNoEditor" subfolder
+                    votv_exe_path = os.path.join(folder_dialog, "WindowsNoEditor", "votv.exe")
+
+                    if os.path.isfile(votv_exe_path):
+                        # Create a subfolder named "WindowsNoEditor" for "votv.exe"
+                        destination_folder = os.path.join(self.game_destination_path, parent_name, "WindowsNoEditor")
+                        try:
+                            shutil.copytree(os.path.dirname(votv_exe_path), destination_folder, dirs_exist_ok=True)
+                        except Exception as e:
+                            QMessageBox.critical(None, "Error", f"An error occurred: {str(e)}")
+                    else:
+                        QMessageBox.warning(None, "Warning", "No 'votv.exe' found in the selected folder or its subfolders.")
+   
     def open_game_backup_folder(self):
-        if self.game_destination_path:    
-            print(self.game_destination_path)        
+        if self.game_destination_path:
             game_backups_path = os.path.join(self.script_directory, "game backups")
-            print(game_backups_path)
             source_save_folder = os.path.join(os.path.expanduser("~"), "AppData", "Local", "VotV", "Saved")
-            
+
             if not os.path.exists(game_backups_path) or not os.path.isdir(game_backups_path):
                 os.makedirs(game_backups_path)
 
-            subprocess.Popen(['explorer', game_backups_path], shell=True)
-            subprocess.Popen(['explorer', source_save_folder], shell=True)
+            # Create startup information for the left and right positions
+            left_startupinfo = subprocess.STARTUPINFO()
+            left_startupinfo.dwX = 100  # Set the X position for the left window
+
+            right_startupinfo = subprocess.STARTUPINFO()
+            right_startupinfo.dwX = 800  # Set the X position for the right window
+
+            subprocess.Popen(['explorer', game_backups_path], shell=True, startupinfo=left_startupinfo)
+            subprocess.Popen(['explorer', source_save_folder], shell=True, startupinfo=right_startupinfo)
 
     def toggle_input(self, state):
         if state == Qt.Checked:
@@ -555,22 +623,16 @@ class GameLauncher(QMainWindow):
             self.file_path_label.setStyleSheet("color: gray;")
             self.file_path_input.setStyleSheet("color: gray;")
             self.action_button.setStyleSheet("color: gray;")
+
             self.action_button.setDisabled(True)
 
-    def perform_action_with_folder_path(self):
-        folder_path = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Folder")
-        if folder_path:
-            self.file_path_input.setText(folder_path)
-            Config.set_game_destination_folder(folder_path)
-            
-    def showDownloadDialog(self):
-        selected_version = self.selected_version   
-        if selected_version in self.version_download_link_map:
-            selected_download_link = self.version_download_link_map[selected_version]
-            print(selected_version)
+    def showDownloadDialog(self):       
+        if self.selected_version in self.game_fetch_worker.get_version_download_link_map():
+            selected_download_link =  self.game_fetch_worker.get_version_download_link_map()[self.selected_version]
+            print(self.selected_version)
             download_dialog = QMessageBox()
             download_dialog.setWindowTitle("Download Confirmation")
-            download_dialog.setText(f'Would you like to download "{selected_version}"?\n\nFiles provided by entechcore at invotek.net')
+            download_dialog.setText(f'Would you like to download "{self.selected_version}"?\n\nFiles provided by entechcore at invotek.net')
             download_dialog.setStandardButtons(QMessageBox.Ok | QMessageBox.Cancel)
             download_dialog.setDefaultButton(QMessageBox.Ok)
 
@@ -579,8 +641,7 @@ class GameLauncher(QMainWindow):
                 download_function = partial(self.download_file, selected_download_link)
                 threading.Thread(target=download_function).start()
         else:
-            print(f"No exact matching version found for '{selected_version}'")
-
+            print(f"No exact matching version found for '{self.selected_version}'")
 
     def download_file(self, url):        
         self.progress_dialog = QProgressDialog(f'Downloading "{self.selected_version}"', 'Cancel', 0, 100, self)
@@ -591,9 +652,6 @@ class GameLauncher(QMainWindow):
         if cancel_buttons:
             cancel_buttons[0].hide()
         self.progress_dialog.setParent(self)
-        self.progress_dialog.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint)
-
-
         self.progress_dialog.setWindowTitle("Downloading")
         QtWidgets.qApp.processEvents()
 
@@ -606,12 +664,14 @@ class GameLauncher(QMainWindow):
     pyqtSlot()
     def cancel_download(self):        
         self.download_worker.cancelled = True 
+        self.progress_dialog.close()
         msg_box = QMessageBox(self)
         msg_box.setWindowModality(Qt.ApplicationModal)
         msg_box.setIcon(QMessageBox.Information)
         msg_box.setWindowTitle("Download Cancelled!")
         msg_box.setText(f'"{self.selected_version}" has stopped downloading!')
-        msg_box.addButton(QMessageBox.Ok)
+        msg_box.addButton(QMessageBox.Ok)        
+        self.progress_dialog.close()
         msg_box.exec_()
         
     pyqtSlot(str)
@@ -627,28 +687,30 @@ class GameLauncher(QMainWindow):
     pyqtSlot()
     def extract_file(self):                                                               
         QtWidgets.qApp.processEvents()        
-        selected_item = self.versions_list.currentItem()
-        selected_version = selected_item.text()
-        self.extract_dialog = QProgressDialog(f'"Extracting" {selected_version}', "Cancel", 0, 0, self)
-        self.extract_dialog.setWindowModality(Qt.WindowModal)
-        cancel_buttons = self.extract_dialog.findChildren(QPushButton)
-        if cancel_buttons:
-            cancel_buttons[0].hide()
-        self.extract_dialog.setWindowTitle("Extracting")
-        self.extract_dialog.show()
+        #selected_item = self.versions_list.currentItem()
+        #selected_version = selected_item.text()
+        #self.extract_dialog = QProgressDialog(f'"Extracting" {selected_version}', "Cancel", 0, 100, self)
+        #self.extract_dialog.setWindowModality(Qt.WindowModal)        
+        #self.extract_dialog.setAutoClose(True)
+        #cancel_buttons = self.extract_dialog.findChildren(QPushButton)
+        #if cancel_buttons:
+        #    cancel_buttons[0].hide()
+        #self.extract_dialog.setWindowTitle("Extracting")
+        #self.extract_dialog.show()
 
         self.download_worker.extract_and_move_thread()
+
+    #pyqtSlot()
+    #def update_extract_progress(self, progress):
+        #self.extract_dialog.setValue(progress)   
 
     pyqtSlot()
     def extraction_finished(self):   
         selected_item = self.versions_list.currentItem()
         selected_version = selected_item.text()
         self.fetch_game_exe(self.game_destination_path)
-        self.extract_dialog.close()
         QMessageBox.information(self, "Download Completed", f'"{selected_version}" has installed successfully.\n\nCheck your library!', QMessageBox.Ok)
         print("Download Completed")
-
-
 
     def fetch_game_exe(self, folder_path):
         try:
@@ -668,7 +730,6 @@ class GameLauncher(QMainWindow):
                 self.game_name_list.addItem(game_path)  # Add each path to the list
         except Exception as e:
             print(f"An error occurred in fetch_game_exe: {str(e)}")
-
     
     def search_for_votv_exe(self, path, game_exe):
         for root, _, files in os.walk(path):
@@ -677,15 +738,13 @@ class GameLauncher(QMainWindow):
                     game_path = os.path.join(root, file)
                     parent_folder = os.path.basename(os.path.dirname(root))
                     game_exe.append(parent_folder)  # Append the full path to 'VotV.exe' to the list
-
                     
     def load_selected_description(self):
         selected_item = self.versions_list.currentItem()
         if selected_item:
             self.selected_version = selected_item.text()
-            print(self.selected_version)
 
-            description = self.final_descriptions_map.get(self.selected_version, "Description not found")
+            description = self.game_fetch_worker.get_final_descriptions_map().get(self.selected_version, "Description not found")
             self.description_text.setHtml(description)
 
     def load_selected_game_exe(self):
@@ -714,21 +773,6 @@ class GameLauncher(QMainWindow):
                 pass
         return False
         
-    def move_in_progress(self, source_backup_folder, destination_folder):
-        files_to_move = os.listdir(source_backup_folder)
-        errors_encountered = False
-
-        for item in files_to_move:
-            source_item = os.path.join(source_backup_folder, item)
-            destination_item = os.path.join(destination_folder, item)
-
-            try:
-                shutil.move(source_item, destination_item)
-            except shutil.Error as e:
-                print(f"Error moving file: {e}")
-                errors_encountered = True
-
-        return errors_encountered
         
     def launch_game(self):
         try:
@@ -750,8 +794,6 @@ class GameLauncher(QMainWindow):
 
             print("Game has started. Now waiting for it to close...")
             self.hide()
-            while self.move_in_progress(source_backup_folder, source_save_folder):
-                time.sleep(1)
 
             while True:
                 stdout = process.stdout.readline()
@@ -824,61 +866,121 @@ class GameLauncher(QMainWindow):
         except Exception as e:
             print(f"Error during backup: {str(e)}")
 
-
-    def save_data(self):
-        if not isinstance(self.version_name_map, dict):
-            raise ValueError("self.version_name_map should be a dictionary")
-        
-        if not isinstance(self.final_descriptions_map, dict):
-            raise ValueError("self.final_descriptions_map should be a dictionary")
-        
-        data = {
-            'version_name_map': self.version_name_map,
-            'final_descriptions_map': self.final_descriptions_map,
-            'version_download_link_map':self.version_download_link_map
-        }
-        with open('cached_data.pk1', 'wb') as file:
-            pickle.dump(data, file, protocol=pickle.HIGHEST_PROTOCOL, fix_imports=False)
-
-    def load_data(self):
-        self.fetch_game_exe(self.game_destination_path)
-        if os.path.exists('cached_data.pk1') and os.access('cached_data.pk1', os.R_OK):
-            with open('cached_data.pk1', 'rb') as file:
-                try:
-                    loaded_data = pickle.load(file, encoding='utf-8')
-                    self.version_name_map = loaded_data['version_name_map']
-                    self.final_descriptions_map = loaded_data['final_descriptions_map'] 
-                    self.version_download_link_map = loaded_data['version_download_link_map']
-                    self.versions_list.clear()
-                    for version_name, description in self.final_descriptions_map.items():
-                        version_name = ''.join(c for c in version_name if ord(c) < 128)
-                        description = ''.join(c for c in description if ord(c) < 128)   
-                        item = QtWidgets.QListWidgetItem(version_name)
-                        self.versions_list.addItem(item)
-                except (pickle.UnpicklingError, EOFError, Exception) as e:
-                    print(f"Error loading data from 'cached_data.pk1': {e}. Proceeding to fetch from the website.")
-        else:
-            print("The pickle file 'cached_data.pk1' does not exist or is not readable. Proceeding to fetch from the website.")
-
     def refetch(self):
+        if not os.path.exists('cached_data.pk1'):
+            # Show a pop-up dialog indicating that data caching is in progress
+            wait_dialog = QMessageBox()
+            wait_dialog.setWindowTitle("Wait for data caching")
+            wait_dialog.setText("Data caching is in progress. Please wait.")
+            wait_dialog.exec_()
+            return
+
         download_dialog = QMessageBox()
         download_dialog.setWindowTitle("Are you sure?")
-        download_dialog.setText(f'Tries to find all available downloads of VotV from invotek.net.\n\nThe program will take a minute to start up again.')
+        download_dialog.setText(f'Finds all available downloads of VotV from invotek.net.\n\nThis may take a while.')
         download_dialog.setStandardButtons(QMessageBox.Ok | QMessageBox.Cancel)
         download_dialog.setDefaultButton(QMessageBox.Ok)
         result = download_dialog.exec_()
 
         if result == QMessageBox.Ok:
-            data_file = 'cached_data.pk1'
-            os.remove(data_file) 
-            python = sys.executable 
-            subprocess.Popen([python] + sys.argv)
-            sys.exit()
+            self.versions_list.clear()
+            self.description_text.clear()
+            os.remove('cached_data.pk1')
+            fetch_function = partial(self.game_fetch_worker.fetch_game_versions)
+            threading.Thread(target=fetch_function).start()
             
-    def fetch_game_versions(self):
+    pyqtSlot()
+    def game_fetch_worker_fetch_game_exe(self):        
+        self.fetch_game_exe(self.game_destination_path)
+            
+
+def load_custom_font():
+    font_db = QtGui.QFontDatabase()
+    font_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'resources/fonts/ShareTechMono-Regular.ttf')
+
+    if os.path.exists(font_path):
+        font_id = font_db.addApplicationFont(font_path)
+        if font_id != -1:
+            font_info = font_db.applicationFontFamilies(font_id)
+            if font_info:
+                app = QtWidgets.QApplication.instance()
+                if app:
+                    app.setFont(QtGui.QFont(font_info[0]))
+
+class GameFetchWorker(QtCore.QObject):
+
+    game_fetch_worker_fetch_game_exe = QtCore.pyqtSignal(str)
+    game_fetch_worker_load_data = QtCore.pyqtSignal()
+    update_fetch_progress = QtCore.pyqtSignal(str)
+
+    def __init__(self):        
+        self.config = Config()
+        self.version_name_map = {}
+        self.versions_list =  CustomListWidget()
+        self.version_names = []
+        self.version_download_link_map = {}
+        self.version_description_map = {}
+        self.final_descriptions_map = {}
+        self.description_text =  QtWidgets.QTextBrowser()  
+        self.html_content = ""                
+        last_refresh_time = self.config.get_last_refresh_time()
+        initial_button_text = "Refresh Versions List | Last Refreshed: " + last_refresh_time        
+        self.reload_data = QtWidgets.QPushButton(initial_button_text) 
+        self.game_destination_path = Config.get_game_destination_folder()
+        self.html_content_and_style =  """
+            <!DOCTYPE html>
+            <html>
+            <head>
+            <style>
+                body {
+                    background-color: #1C1C1C;
+                    color: white;
+                    font-size: 15px;
+                }
+                p {
+                    font-size: 18px;
+                }
+                body h1 {
+                    font-size: 20px;
+                }
+                body h1 {
+                    font-size: 20px;
+                }
+            </style>
+            </head>
+            <body>
+            """
+        super().__init__()
+
+    def get_version_name_map(self):
+        return self.version_name_map   
+
+    def get_versions_list(self):
+        return self.versions_list   
+
+    def get_version_names(self):
+        return self.version_names   
+
+    def get_version_download_link_map(self):
+        return self.version_download_link_map   
+
+    def get_version_description_map(self):
+        return self.version_description_map   
+
+    def get_final_descriptions_map(self):
+        return self.final_descriptions_map
+
+    def get_html_content_and_style(self):
+        return self.html_content_and_style      
+
+    def get_description_text(self):
+        return self.description_text   
+
+    def get_reload_data(self):
+        return self.reload_data   
+
+    def fetch_game_versions(self):    
         if not os.path.exists('cached_data.pk1') or not os.access('cached_data.pk1', os.R_OK):
-            print("Fetching game versions")
-            self.fetch_game_exe(self.game_destination_path)
             url = "https://www.invotek.net/releases"
             try:
                 response = requests.get(url)
@@ -889,10 +991,9 @@ class GameLauncher(QMainWindow):
                     soup = BeautifulSoup(html, 'html.parser')
                     release_containers = soup.find_all('div', class_='release-container')
                     self.process_release_containers(release_containers)
-                    self.save_data()
             except requests.exceptions.RequestException as e:
                 print(f"Error: {e}")
-            self.fetch_descriptions()
+            self.fetch_descriptions()       
         else:
             self.load_data()
 
@@ -935,15 +1036,13 @@ class GameLauncher(QMainWindow):
                 if not description_link.startswith("https"):
                     description_link = f"https://www.invotek.net{description_link}"
                 result = f"{result_2} {text} {description_link}\n"
-
         return result
+    
     def fetch_descriptions(self):
         for selected_version, description in self.version_description_map.items():
-            self.description_text.setPlainText(description)
             modified_description = f"<p>{description}</p>\n\n"
             first_link = self.find_first_link(description)
-            self.html_content = self.html_content_and_style
-
+            self.html_content =  self.html_content_and_style
             if first_link:
                 if first_link.endswith('.txt'):
                     link_response = requests.get(first_link)
@@ -978,29 +1077,70 @@ class GameLauncher(QMainWindow):
             modified_description = re.sub(r'http[s]?://\S+', '', modified_description)
             modified_description = re.sub(r'Discord changelog|website changelog|to Discord post', '', modified_description, flags=re.IGNORECASE)
             modified_description = re.sub(r'https://discord\.com', '', modified_description)
-            self.final_descriptions_map[selected_version] = modified_description
-        self.save_data()
+            self.final_descriptions_map[selected_version] = modified_description      
+            current_time = QDateTime.currentDateTime().toString(Qt.DefaultLocaleLongDate)
+            self.reload_data.setText("Refresh Versions List | Last Refreshed: " + current_time)
+
+            # Set the last refresh time in the configuration
+            Config.set_last_refresh_time(current_time)
+        self.save_data()    
+
+        
+    def save_data(self):
+        if not isinstance(self.version_name_map, dict):
+            raise ValueError("self.version_name_map should be a dictionary")
+
+        if not isinstance(self.final_descriptions_map, dict):
+            raise ValueError("self.final_descriptions_map should be a dictionary")
+
+        data = {
+            'version_name_map': self.version_name_map,
+            'final_descriptions_map': self.final_descriptions_map,
+            'version_download_link_map': self.version_download_link_map
+        }
+
+        # Save data as a pickle file
+        with open('cached_data.pk1', 'wb') as pickle_file:
+            pickle.dump(data, pickle_file, protocol=pickle.HIGHEST_PROTOCOL, fix_imports=False)
+
+        # Save data as a text file
+        with open('cached_data.txt', 'w', encoding='utf-8') as text_file:
+            for key, value in data.items():
+                text_file.write(f"{key}:\n")
+                if isinstance(value, dict):
+                    for subkey, subvalue in value.items():
+                        text_file.write(f"  {subkey}: {subvalue}\n")
+                else:
+                    text_file.write(f"  {value}\n")
+
+        # Print a confirmation message
+        print("Data saved as cached_data.pk1 and cached_data.txt")
+
+
+    def load_data(self):        
+        self.game_fetch_worker_fetch_game_exe.emit(self.game_destination_path)
+        if os.path.exists('cached_data.pk1') and os.access('cached_data.pk1', os.R_OK):
+            with open('cached_data.pk1', 'rb') as file:
+                try:
+                    loaded_data = pickle.load(file, encoding='utf-8')
+                    self.version_name_map = loaded_data['version_name_map']
+                    self.final_descriptions_map = loaded_data['final_descriptions_map'] 
+                    self.version_download_link_map = loaded_data['version_download_link_map']
+                    self.versions_list.clear()
+                    for version_name, description in self.final_descriptions_map.items():
+                        version_name = ''.join(c for c in version_name if ord(c) < 128)
+                        description = ''.join(c for c in description if ord(c) < 128)   
+                        item = QtWidgets.QListWidgetItem(version_name)
+                        self.versions_list.addItem(item)
+                except (pickle.UnpicklingError, EOFError, Exception) as e:
+                    print(f"Error loading data from 'cached_data.pk1': {e}. Proceeding to fetch from the website.")
+        else:
+            print("The pickle file 'cached_data.pk1' does not exist or is not readable. Proceeding to fetch from the website.")
 
     def find_first_link(self, text):
         import re
         urls = re.findall(r'(https?://[^\s]+)', text)
         return urls[0] if urls else None
-
-def sanitize_folder_name(name):
-    return re.sub(r'[\/:*?"<>|]', '_', name)
-
-def load_custom_font():
-    font_db = QtGui.QFontDatabase()
-    font_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'resources/fonts/ShareTechMono-Regular.ttf')
-
-    if os.path.exists(font_path):
-        font_id = font_db.addApplicationFont(font_path)
-        if font_id != -1:
-            font_info = font_db.applicationFontFamilies(font_id)
-            if font_info:
-                app = QtWidgets.QApplication.instance()
-                if app:
-                    app.setFont(QtGui.QFont(font_info[0]))
 
 class TitleBar(QtWidgets.QDialog):
     def __init__(self, parent):
@@ -1104,8 +1244,6 @@ class TitleBar(QtWidgets.QDialog):
         if event.buttons() == QtCore.Qt.LeftButton:
             self.parent.move(event.globalPos() - self.parent.dragPosition)
 
-
-
 def QIcon_from_svg(svg_filepath, color='black'):
     script_dir = os.path.dirname(os.path.abspath(__file__))
     absolute_path = os.path.join(script_dir, svg_filepath) 
@@ -1123,7 +1261,8 @@ if __name__ == "__main__":
     app = QtWidgets.QApplication(sys.argv)
     load_custom_font()
     download_worker = DownloadWorker()
-    window = GameLauncher(download_worker)
+    game_fetch_worker = GameFetchWorker()
+    window = VoidLauncher(download_worker, game_fetch_worker)
     window.show()
     sys.exit(app.exec_())
 
